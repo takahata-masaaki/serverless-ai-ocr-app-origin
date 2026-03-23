@@ -1,0 +1,123 @@
+import os, json
+from datetime import datetime, timezone
+import boto3
+from botocore.exceptions import ClientError
+
+REGION = os.getenv("AWS_REGION", "us-east-1")
+MODEL_REGION = os.getenv("MODEL_REGION") or REGION
+MODEL_ID = os.getenv("MODEL_ID", "")
+LLM_MAX_CHARS = int(os.getenv("LLM_MAX_CHARS", "12000"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1200"))
+
+BUCKET = os.environ["BUCKET_NAME"]
+JOBS_TABLE = os.environ["JOBS_TABLE_NAME"]
+
+ddb = boto3.resource("dynamodb", region_name=REGION)
+s3 = boto3.client("s3", region_name=REGION)
+br = boto3.client("bedrock-runtime", region_name=MODEL_REGION)
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+def corsafe(s: str) -> str:
+    return (s or "")[:900]
+
+def call_claude(ocr_text: str) -> dict:
+    if not MODEL_ID:
+        raise RuntimeError("MODEL_ID is empty")
+
+    ocr_text = (ocr_text or "")[:LLM_MAX_CHARS]
+
+    prompt = (
+        "次のOCRテキストを整形してください。追加の文章は禁止。\n"
+        "必ず JSON 1個のみで返す。\n"
+        "形式: {\"structured\": <object>, \"markdown\": \"<string>\"}\n\n"
+        "OCR_TEXT:\n" + ocr_text
+    )
+
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": LLM_MAX_TOKENS,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+    }
+
+    resp = br.invoke_model(
+        modelId=MODEL_ID,
+        body=json.dumps(body).encode("utf-8"),
+        accept="application/json",
+        contentType="application/json",
+    )
+    payload = json.loads(resp["body"].read())
+    out_text = payload["content"][0]["text"].strip()
+
+    # ```json ``` 対策
+    if out_text.startswith("```"):
+        out_text = out_text.strip("`")
+        out_text = out_text[out_text.find("\n")+1:].strip()
+
+    return json.loads(out_text)
+
+def handler(event, context):
+    job_id = event.get("job_id")
+    s3_key = event.get("s3_key", "")
+
+    t = ddb.Table(JOBS_TABLE)
+    item = t.get_item(Key={"id": job_id}).get("Item") or {}
+    st = item.get("status", "")
+
+    # DONE/FAILED は再実行しない（冪等）
+    if st in ("DONE", "FAILED"):
+        return {"ok": True, "skipped": True, "status": st}
+
+    try:
+        # PROCESSING
+        t.update_item(
+            Key={"id": job_id},
+            UpdateExpression="SET #st=:p, ocr_input_key=:k, updated_at=:u",
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={":p": "PROCESSING", ":k": s3_key, ":u": now()},
+        )
+
+        # 画像が読めるか確認（ここを将来 Azure/Yomitoku OCR に差し替え）
+        b = s3.get_object(Bucket=BUCKET, Key=s3_key)["Body"].read()
+        ocr_text = f"OK bytes={len(b)} key={s3_key}"
+
+        # Bedrock整形（JSON+MD）
+        out = call_claude(ocr_text)
+        structured = out.get("structured", {})
+        markdown = out.get("markdown", "")
+
+        # outputs へ保存（1ジョブ1回の証拠）
+        js_key = f"outputs/{job_id}/structured.json"
+        md_key = f"outputs/{job_id}/output.md"
+
+        s3.put_object(
+            Bucket=BUCKET, Key=js_key,
+            Body=json.dumps(structured, ensure_ascii=False).encode("utf-8"),
+            ContentType="application/json; charset=utf-8",
+        )
+        s3.put_object(
+            Bucket=BUCKET, Key=md_key,
+            Body=str(markdown).encode("utf-8"),
+            ContentType="text/markdown; charset=utf-8",
+        )
+
+        # DONE
+        t.update_item(
+            Key={"id": job_id},
+            UpdateExpression="SET #st=:d, ocr_engine=:e, updated_at=:u",
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={":d": "DONE", ":e": "BEDROCK_TEST", ":u": now()},
+        )
+
+        return {"ok": True, "job_id": job_id}
+
+    except Exception as e:
+        t.update_item(
+            Key={"id": job_id},
+            UpdateExpression="SET #st=:f, error=:er, updated_at=:u",
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={":f": "FAILED", ":er": corsafe(str(e)), ":u": now()},
+        )
+        raise

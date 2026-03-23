@@ -1,0 +1,12 @@
+{
+  "StartAt": "Placeholder",
+  "States": {
+    "Placeholder": {
+      "Type": "Pass",
+      "Result": {
+        "status": "SFN_READY_BUT_NOT_IMPLEMENTED"
+      },
+      "End": true
+    }
+  }
+}

@@ -1,0 +1,215 @@
+import os
+import json
+import time
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
+
+import boto3
+
+REGION = os.getenv("AWS_REGION", "us-east-1")
+MODEL_REGION = os.getenv("MODEL_REGION") or REGION
+MODEL_ID = os.getenv("MODEL_ID", "")
+LLM_MAX_CHARS = int(os.getenv("LLM_MAX_CHARS", "12000"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1200"))
+
+BUCKET = os.environ["BUCKET_NAME"]
+JOBS_TABLE = os.environ["JOBS_TABLE_NAME"]
+IMAGES_TABLE = os.environ["IMAGES_TABLE_NAME"]
+
+OCR_ENGINE = os.getenv("OCR_ENGINE", "azure_vision")
+AZURE_VISION_ENDPOINT = os.getenv("AZURE_VISION_ENDPOINT", "").rstrip("/")
+AZURE_VISION_KEY = os.getenv("AZURE_VISION_KEY", "")
+AZURE_VISION_API_VERSION = os.getenv("AZURE_VISION_API_VERSION", "v3.2")
+
+ddb = boto3.resource("dynamodb", region_name=REGION)
+s3 = boto3.client("s3", region_name=REGION)
+br = boto3.client("bedrock-runtime", region_name=MODEL_REGION)
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+def corsafe(s: str) -> str:
+    return (s or "")[:900]
+
+def call_claude(ocr_text: str) -> dict:
+    if not MODEL_ID:
+        raise RuntimeError("MODEL_ID is empty")
+
+    ocr_text = (ocr_text or "")[:LLM_MAX_CHARS]
+
+    prompt = (
+        "次のOCRテキストを整形してください。追加の文章は禁止。\n"
+        "必ず JSON 1個のみで返す。\n"
+        "形式: {\"structured\": <object>, \"markdown\": \"<string>\"}\n\n"
+        "OCR_TEXT:\n" + ocr_text
+    )
+
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": LLM_MAX_TOKENS,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+    }
+
+    resp = br.invoke_model(
+        modelId=MODEL_ID,
+        body=json.dumps(body).encode("utf-8"),
+        accept="application/json",
+        contentType="application/json",
+    )
+    payload = json.loads(resp["body"].read())
+    out_text = payload["content"][0]["text"].strip()
+
+    if out_text.startswith("```"):
+        out_text = out_text.strip("`")
+        out_text = out_text[out_text.find("\n") + 1:].strip()
+
+    return json.loads(out_text)
+
+def azure_read_ocr(blob: bytes, content_type: str) -> str:
+    if not AZURE_VISION_ENDPOINT or not AZURE_VISION_KEY:
+        raise RuntimeError("AZURE_VISION_ENDPOINT or AZURE_VISION_KEY is empty")
+
+    analyze_url = f"{AZURE_VISION_ENDPOINT}/vision/{AZURE_VISION_API_VERSION}/read/analyze"
+
+    req = urllib.request.Request(
+        analyze_url,
+        data=blob,
+        method="POST",
+        headers={
+            "Ocp-Apim-Subscription-Key": AZURE_VISION_KEY,
+            "Content-Type": content_type or "application/octet-stream",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            op_loc = r.headers.get("Operation-Location")
+            if not op_loc:
+                raise RuntimeError("Azure Operation-Location header missing")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"Azure POST failed: {e.code} {detail}")
+
+    # poll
+    for _ in range(30):
+        time.sleep(2)
+        poll_req = urllib.request.Request(
+            op_loc,
+            method="GET",
+            headers={"Ocp-Apim-Subscription-Key": AZURE_VISION_KEY},
+        )
+        try:
+            with urllib.request.urlopen(poll_req, timeout=60) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"Azure poll failed: {e.code} {detail}")
+
+        status = (data.get("status") or "").lower()
+        if status == "succeeded":
+            lines = []
+            for page in data.get("analyzeResult", {}).get("readResults", []):
+                for line in page.get("lines", []):
+                    text = line.get("text", "")
+                    if text:
+                        lines.append(text)
+            return "\n".join(lines).strip()
+
+        if status == "failed":
+            raise RuntimeError(f"Azure OCR failed: {json.dumps(data, ensure_ascii=False)}")
+
+    raise RuntimeError("Azure OCR polling timeout")
+
+def extract_ocr_text(blob: bytes, content_type: str) -> str:
+    # まずは最短復旧: Azure Vision に一本化
+    return azure_read_ocr(blob, content_type)
+
+def handler(event, context):
+    job_id = event.get("job_id")
+    app_name = event.get("app_name", "")
+    image_id = event.get("image_id", "")
+    s3_key = event.get("s3_key", "")
+
+    if not job_id or not s3_key:
+        raise RuntimeError("job_id or s3_key missing")
+
+    jobs_t = ddb.Table(JOBS_TABLE)
+    images_t = ddb.Table(IMAGES_TABLE)
+
+    item = jobs_t.get_item(Key={"id": job_id}).get("Item") or {}
+    st = item.get("status", "")
+
+    if st in ("DONE", "FAILED"):
+        return {"ok": True, "skipped": True, "status": st}
+
+    try:
+        jobs_t.update_item(
+            Key={"id": job_id},
+            UpdateExpression="SET #st=:p, ocr_input_key=:k, updated_at=:u",
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={":p": "PROCESSING", ":k": s3_key, ":u": now()},
+        )
+
+        obj = s3.get_object(Bucket=BUCKET, Key=s3_key)
+        blob = obj["Body"].read()
+        content_type = obj.get("ContentType", "application/octet-stream")
+
+        # 本物OCR
+        ocr_text = extract_ocr_text(blob, content_type)
+        if not ocr_text.strip():
+            raise RuntimeError("OCR text is empty")
+
+        out = call_claude(ocr_text)
+        structured = out.get("structured", {})
+        markdown = out.get("markdown", "")
+
+        js_key = f"outputs/{job_id}/structured.json"
+        md_key = f"outputs/{job_id}/output.md"
+
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=js_key,
+            Body=json.dumps(structured, ensure_ascii=False).encode("utf-8"),
+            ContentType="application/json; charset=utf-8",
+        )
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=md_key,
+            Body=str(markdown).encode("utf-8"),
+            ContentType="text/markdown; charset=utf-8",
+        )
+
+        jobs_t.update_item(
+            Key={"id": job_id},
+            UpdateExpression="SET #st=:d, ocr_engine=:e, updated_at=:u",
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={":d": "DONE", ":e": "AZURE_VISION", ":u": now()},
+        )
+
+        if app_name and image_id:
+            images_t.update_item(
+                Key={"app_name": app_name, "image_id": image_id},
+                UpdateExpression="SET #st=:d, updated_at=:u",
+                ExpressionAttributeNames={"#st": "status"},
+                ExpressionAttributeValues={":d": "completed", ":u": now()},
+            )
+
+        return {"ok": True, "job_id": job_id}
+
+    except Exception as e:
+        jobs_t.update_item(
+            Key={"id": job_id},
+            UpdateExpression="SET #st=:f, #err=:er, updated_at=:u",
+            ExpressionAttributeNames={"#st": "status", "#err": "error"},
+            ExpressionAttributeValues={":f": "FAILED", ":er": corsafe(str(e)), ":u": now()},
+        )
+        if app_name and image_id:
+            images_t.update_item(
+                Key={"app_name": app_name, "image_id": image_id},
+                UpdateExpression="SET #st=:f, updated_at=:u",
+                ExpressionAttributeNames={"#st": "status"},
+                ExpressionAttributeValues={":f": "failed", ":u": now()},
+            )
+        raise

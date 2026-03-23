@@ -1,0 +1,170 @@
+import json
+import os
+import uuid
+import boto3
+from datetime import datetime, timezone
+from boto3.dynamodb.conditions import Key
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+def handler(event, context):
+    try:
+        path = event.get('path', '')
+        method = event.get('httpMethod', '')
+        db = boto3.resource('dynamodb')
+        s3 = boto3.client('s3')
+        lambda_client = boto3.client('lambda')
+
+        images_table = db.Table(os.environ.get('IMAGES_TABLE_NAME', ''))
+        jobs_table = db.Table(os.environ.get('JOBS_TABLE_NAME', ''))
+        worker_fn = os.environ.get('OCR_WORKER_FN', '')
+
+        # 1. GET /images
+        if '/images' in path and method == 'GET':
+            app_name = (event.get('queryStringParameters') or {}).get('app_name', 'default')
+            response = images_table.query(
+                KeyConditionExpression=Key('app_name').eq(app_name)
+            )
+            items = response.get('Items', [])
+            for item in items:
+                if 'name' not in item:
+                    item['name'] = item.get('filename', 'Unknown')
+            return {
+                "statusCode": 200,
+                "headers": {"Access-Control-Allow-Origin": "*"},
+                "body": json.dumps({"images": items}, ensure_ascii=False)
+            }
+
+        # 2. POST /generate-presigned-url
+        elif '/generate-presigned-url' in path and method == 'POST':
+            body = json.loads(event.get('body') or '{}')
+            image_id = str(uuid.uuid4())
+            filename = body.get('filename', 'file.pdf')
+            s3_key = f"uploads/{image_id}/{filename}"
+
+            url = s3.generate_presigned_url(
+                ClientMethod='put_object',
+                Params={
+                    'Bucket': os.environ.get('BUCKET_NAME', ''),
+                    'Key': s3_key,
+                    'ContentType': body.get('content_type', body.get('contentType', 'application/pdf'))
+                },
+                ExpiresIn=3600
+            )
+
+            return {
+                "statusCode": 200,
+                "headers": {"Access-Control-Allow-Origin": "*"},
+                "body": json.dumps({
+                    "presigned_url": url,
+                    "s3_key": s3_key,
+                    "image_id": image_id
+                }, ensure_ascii=False)
+            }
+
+        # 3. POST /upload-complete
+        elif '/upload-complete' in path and method == 'POST':
+            body = json.loads(event.get('body') or '{}')
+            filename = body.get('filename', 'Unknown')
+            app_name = body.get('app_name', 'default')
+            image_id = body.get('image_id')
+            s3_key = body.get('s3_key')
+
+            images_table.put_item(Item={
+                'app_name': app_name,
+                'image_id': image_id,
+                'name': filename,
+                'filename': filename,
+                's3_key': s3_key,
+                'status': 'pending',
+                'uploadTime': now()
+            })
+
+            return {
+                "statusCode": 200,
+                "headers": {"Access-Control-Allow-Origin": "*"},
+                "body": json.dumps({"status": "ok"}, ensure_ascii=False)
+            }
+
+        # 4. POST /ocr/start
+        elif '/ocr/start' in path and method == 'POST':
+            body = json.loads(event.get('body') or '{}')
+            app_name = body.get('app_name', 'default')
+
+            response = images_table.query(
+                KeyConditionExpression=Key('app_name').eq(app_name)
+            )
+            items = response.get('Items', [])
+            pending_items = [item for item in items if item.get('status') == 'pending']
+
+            kicked = []
+
+            for item in pending_items:
+                image_id = item['image_id']
+                s3_key = item.get('s3_key', '')
+                filename = item.get('filename', item.get('name', 'Unknown'))
+                job_id = image_id   # 現行簡易運用
+
+                jobs_table.put_item(Item={
+                    'id': job_id,
+                    'job_id': job_id,
+                    'app_name': app_name,
+                    'image_id': image_id,
+                    'filename': filename,
+                    's3_key': s3_key,
+                    'status': 'QUEUED_OCR',
+                    'created_at': now(),
+                    'updated_at': now()
+                })
+
+                images_table.update_item(
+                    Key={'app_name': app_name, 'image_id': image_id},
+                    UpdateExpression="SET #s = :stat",
+                    ExpressionAttributeNames={'#s': 'status'},
+                    ExpressionAttributeValues={':stat': 'processing'}
+                )
+
+                if worker_fn:
+                    worker_payload = {
+                        "job_id": job_id,
+                        "app_name": app_name,
+                        "image_id": image_id,
+                        "s3_key": s3_key
+                    }
+                    lambda_client.invoke(
+                        FunctionName=worker_fn,
+                        InvocationType='Event',
+                        Payload=json.dumps(worker_payload).encode("utf-8")
+                    )
+
+                kicked.append({
+                    "job_id": job_id,
+                    "image_id": image_id,
+                    "filename": filename,
+                    "s3_key": s3_key
+                })
+
+            return {
+                "statusCode": 200,
+                "headers": {"Access-Control-Allow-Origin": "*"},
+                "body": json.dumps({
+                    "status": "ok",
+                    "app_name": app_name,
+                    "count": len(kicked),
+                    "jobs": kicked
+                }, ensure_ascii=False)
+            }
+
+        return {
+            "statusCode": 404,
+            "headers": {"Access-Control-Allow-Origin": "*"},
+            "body": json.dumps({"error": "Not found"}, ensure_ascii=False)
+        }
+
+    except Exception as e:
+        return {
+            "statusCode": 500,
+            "headers": {"Access-Control-Allow-Origin": "*"},
+            "body": json.dumps({"error": str(e)}, ensure_ascii=False)
+        }

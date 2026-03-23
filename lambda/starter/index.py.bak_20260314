@@ -1,0 +1,85 @@
+import json
+import os
+import uuid
+import boto3
+from datetime import datetime
+from boto3.dynamodb.conditions import Key
+
+def handler(event, context):
+    try:
+        path = event.get('path', '')
+        method = event.get('httpMethod', '')
+        db = boto3.resource('dynamodb')
+        images_table = db.Table(os.environ.get('IMAGES_TABLE_NAME', ''))
+        
+        # 1. 画像一覧の取得 (GET /images)
+        if '/images' in path and method == 'GET':
+            app_name = event.get('queryStringParameters', {}).get('app_name', 'default')
+            response = images_table.query(KeyConditionExpression=Key('app_name').eq(app_name))
+            items = response.get('Items', [])
+            for item in items:
+                if 'name' not in item:
+                    item['name'] = item.get('filename', 'Unknown')
+            return {"statusCode": 200, "headers": {"Access-Control-Allow-Origin": "*"}, "body": json.dumps({"images": items})}
+
+        # 2. アップロード準備 (POST /generate-presigned-url)
+        elif '/generate-presigned-url' in path:
+            body = json.loads(event.get('body') or '{}')
+            image_id = str(uuid.uuid4())
+            s3_key = f"uploads/{image_id}/{body.get('filename', 'file.pdf')}"
+            s3 = boto3.client('s3')
+            url = s3.generate_presigned_url(ClientMethod='put_object', Params={'Bucket': os.environ.get('BUCKET_NAME', ''), 'Key': s3_key, 'ContentType': body.get('content_type', 'application/pdf')}, ExpiresIn=3600)
+            return {"statusCode": 200, "headers": {"Access-Control-Allow-Origin": "*"}, "body": json.dumps({"presigned_url": url, "s3_key": s3_key, "image_id": image_id})}
+
+        # 3. アップロード完了記帳 (POST /upload-complete)
+        elif '/upload-complete' in path:
+            body = json.loads(event.get('body') or '{}')
+            filename = body.get('filename', 'Unknown')
+            images_table.put_item(Item={
+                'app_name': body.get('app_name', 'default'), 'image_id': body.get('image_id'),
+                'name': filename, 'filename': filename, 's3_key': body.get('s3_key'),
+                'status': 'pending', 'uploadTime': datetime.utcnow().isoformat()
+            })
+            return {"statusCode": 200, "headers": {"Access-Control-Allow-Origin": "*"}, "body": json.dumps({"status": "ok"})}
+
+        # 4. OCR処理開始
+        elif '/ocr/start' in path:
+            body = json.loads(event.get('body') or '{}')
+            app_name = body.get('app_name', 'default')
+            job_id = str(uuid.uuid4())
+            
+            # ★ 修正ポイント：DynamoDBが求める 'id' というキーを追加
+            jobs_table = db.Table(os.environ.get('JOBS_TABLE_NAME'))
+            jobs_table.put_item(Item={
+                'id': job_id,           # ← これが足りなかった犯人！
+                'job_id': job_id,       # （念のため以前のキーも残します）
+                'app_name': app_name, 
+                'status': 'processing', 
+                'createdAt': datetime.utcnow().isoformat()
+            })
+            
+            response = images_table.query(KeyConditionExpression=Key('app_name').eq(app_name))
+            for item in response.get('Items', []):
+                if item.get('status') == 'pending':
+                    images_table.update_item(
+                        Key={'app_name': app_name, 'image_id': item['image_id']},
+                        UpdateExpression="set #s = :stat", ExpressionAttributeNames={'#s': 'status'}, ExpressionAttributeValues={':stat': 'processing'}
+                    )
+            
+            # 実働部隊（WorkerLambda）をキック
+            lambda_client = boto3.client('lambda')
+            worker_fn = os.environ.get('OCR_WORKER_FN')
+            if worker_fn:
+                worker_payload = {"app_name": app_name, "job_id": job_id}
+                lambda_client.invoke(
+                    FunctionName=worker_fn,
+                    InvocationType='Event',
+                    Payload=json.dumps(worker_payload)
+                )
+
+            return {"statusCode": 200, "headers": {"Access-Control-Allow-Origin": "*"}, "body": json.dumps({"jobId": job_id})}
+
+        return {"statusCode": 404, "headers": {"Access-Control-Allow-Origin": "*"}, "body": json.dumps({"error": "Not found"})}
+        
+    except Exception as e:
+        return {"statusCode": 500, "headers": {"Access-Control-Allow-Origin": "*"}, "body": json.dumps({"error": str(e)})}
