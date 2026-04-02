@@ -4,8 +4,10 @@ import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import boto3
+from botocore.exceptions import ClientError
 
 REGION = os.getenv("AWS_REGION", "us-east-1")
 MODEL_REGION = os.getenv("MODEL_REGION") or REGION
@@ -17,7 +19,11 @@ BUCKET = os.environ["BUCKET_NAME"]
 JOBS_TABLE = os.environ["JOBS_TABLE_NAME"]
 IMAGES_TABLE = os.environ["IMAGES_TABLE_NAME"]
 
-OCR_ENGINE = os.getenv("OCR_ENGINE", "yomitoku_ec2").lower()
+USAGE_TABLE = os.getenv("USAGE_METRICS_TABLE_NAME", "")
+if not USAGE_TABLE:
+    raise RuntimeError("USAGE_METRICS_TABLE_NAME is empty")
+
+OCR_ENGINE = os.getenv("OCR_ENGINE", "azure").lower()
 YOMITOKU_EC2_URL = os.getenv("YOMITOKU_EC2_URL", "").rstrip("/")
 AZURE_VISION_ENDPOINT = os.getenv("AZURE_VISION_ENDPOINT", "").rstrip("/")
 AZURE_VISION_KEY = os.getenv("AZURE_VISION_KEY", "")
@@ -27,18 +33,62 @@ ddb = boto3.resource("dynamodb", region_name=REGION)
 s3 = boto3.client("s3", region_name=REGION)
 br = boto3.client("bedrock-runtime", region_name=MODEL_REGION)
 
+usage_t = ddb.Table(USAGE_TABLE)
+
+def safe_update_image(images_t, app_name, image_id, *, update_expression, expr_names, expr_values):
+    try:
+        images_t.update_item(
+            Key={"app_name": app_name, "image_id": image_id},
+            UpdateExpression=update_expression,
+            ExpressionAttributeNames=expr_names,
+            ExpressionAttributeValues=expr_values,
+            ConditionExpression="attribute_exists(s3_key)",
+        )
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code == "ConditionalCheckFailedException":
+            print(f"SKIP image update: base row missing app_name={app_name} image_id={image_id}")
+            return
+        raise
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
 def corsafe(s: str) -> str:
     return (s or "")[:900]
 
-def call_claude(ocr_text: str) -> dict:
-    if not MODEL_ID:
-        raise RuntimeError("MODEL_ID is empty")
+def record_usage_total(page_count: int, input_tokens: int, output_tokens: int, used_engine: str, cost_jpy: Decimal):
+    add_parts = [
+        "total_jobs :one",
+        "total_pages :pc",
+        "total_input_tokens :it",
+        "total_output_tokens :ot",
+        "total_cost_jpy :cost"
+    ]
 
+    used_engine = (used_engine or "").upper()
+    if used_engine == "AZURE_VISION":
+        add_parts.append("azure_jobs :one")
+    elif used_engine == "YOMITOKU_EC2":
+        add_parts.append("yomitoku_jobs :one")
+
+    usage_t.update_item(
+        Key={"metric_date": "TOTAL"},
+        UpdateExpression=f"SET updated_at=:u, last_engine=:e ADD {', '.join(add_parts)}",
+        ExpressionAttributeValues={
+            ":u": now(),
+            ":e": used_engine,
+            ":one": 1,
+            ":pc": int(page_count or 0),
+            ":it": int(input_tokens or 0),
+            ":ot": int(output_tokens or 0),
+            ":cost": cost_jpy
+        },
+    )
+
+def call_claude(ocr_text: str):
+    if not MODEL_ID: raise RuntimeError("MODEL_ID is empty")
     ocr_text = (ocr_text or "")[:LLM_MAX_CHARS]
-
     prompt = (
         "あなたの仕事はOCR結果を整形することだけです。\n"
         "OCR_TEXTに存在しない内容を絶対に追加してはいけません。\n"
@@ -48,14 +98,12 @@ def call_claude(ocr_text: str) -> dict:
         "形式: {\"structured\": <object>, \"markdown\": \"<string>\"}\n\n"
         "OCR_TEXT:\n" + ocr_text
     )
-
     body = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": LLM_MAX_TOKENS,
         "temperature": 0,
         "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
     }
-
     resp = br.invoke_model(
         modelId=MODEL_ID,
         body=json.dumps(body).encode("utf-8"),
@@ -64,146 +112,99 @@ def call_claude(ocr_text: str) -> dict:
     )
     payload = json.loads(resp["body"].read())
     out_text = payload["content"][0]["text"].strip()
-
     if out_text.startswith("```"):
         out_text = out_text.strip("`")
         out_text = out_text[out_text.find("\n") + 1:].strip()
+    parsed = json.loads(out_text)
+    usage = payload.get("usage") or {}
+    return parsed, {
+        "input_tokens": int(usage.get("input_tokens", 0) or 0),
+        "output_tokens": int(usage.get("output_tokens", 0) or 0),
+    }
 
-    return json.loads(out_text)
-
-def azure_read_ocr(blob: bytes, content_type: str) -> str:
+def azure_read_ocr(blob: bytes, content_type: str):
     if not AZURE_VISION_ENDPOINT or not AZURE_VISION_KEY:
         raise RuntimeError("AZURE_VISION_ENDPOINT or AZURE_VISION_KEY is empty")
-
     analyze_url = f"{AZURE_VISION_ENDPOINT}/vision/{AZURE_VISION_API_VERSION}/read/analyze"
-
-    req = urllib.request.Request(
-        analyze_url,
-        data=blob,
-        method="POST",
-        headers={
-            "Ocp-Apim-Subscription-Key": AZURE_VISION_KEY,
-            "Content-Type": content_type or "application/octet-stream",
-        },
-    )
-
+    req = urllib.request.Request(analyze_url, data=blob, method="POST", headers={"Ocp-Apim-Subscription-Key": AZURE_VISION_KEY, "Content-Type": content_type or "application/octet-stream"})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             op_loc = r.headers.get("Operation-Location")
-            if not op_loc:
-                raise RuntimeError("Azure Operation-Location header missing")
+            if not op_loc: raise RuntimeError("Azure Operation-Location header missing")
     except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"Azure POST failed: {e.code} {detail}")
+        raise RuntimeError(f"Azure POST failed: {e.code} {e.read().decode('utf-8', errors='ignore')}")
 
     for _ in range(30):
         time.sleep(2)
-        poll_req = urllib.request.Request(
-            op_loc,
-            method="GET",
-            headers={"Ocp-Apim-Subscription-Key": AZURE_VISION_KEY},
-        )
+        poll_req = urllib.request.Request(op_loc, method="GET", headers={"Ocp-Apim-Subscription-Key": AZURE_VISION_KEY})
         try:
             with urllib.request.urlopen(poll_req, timeout=60) as r:
                 data = json.loads(r.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"Azure poll failed: {e.code} {detail}")
-
+            raise RuntimeError(f"Azure poll failed: {e.code} {e.read().decode('utf-8', errors='ignore')}")
         status = (data.get("status") or "").lower()
         if status == "succeeded":
             lines = []
-            for page in data.get("analyzeResult", {}).get("readResults", []):
+            pages = data.get("analyzeResult", {}).get("readResults", []) or []
+            page_count = len(pages) if pages else 1
+            for page in pages:
                 for line in page.get("lines", []):
                     text = line.get("text", "")
-                    if text:
-                        lines.append(text)
-            return "\n".join(lines).strip()
-
-        if status == "failed":
-            raise RuntimeError(f"Azure OCR failed: {json.dumps(data, ensure_ascii=False)}")
-
+                    if text: lines.append(text)
+            return "\n".join(lines).strip(), page_count
+        if status == "failed": raise RuntimeError(f"Azure OCR failed: {json.dumps(data, ensure_ascii=False)}")
     raise RuntimeError("Azure OCR polling timeout")
 
-def yomitoku_ec2_ocr(blob: bytes, content_type: str) -> str:
-    if not YOMITOKU_EC2_URL:
-        raise RuntimeError("YOMITOKU_EC2_URL is empty")
-
-    req = urllib.request.Request(
-        YOMITOKU_EC2_URL,
-        data=blob,
-        method="POST",
-        headers={
-            "Content-Type": content_type or "application/octet-stream",
-        },
-    )
-
+def yomitoku_ec2_ocr(blob: bytes, content_type: str):
+    if not YOMITOKU_EC2_URL: raise RuntimeError("YOMITOKU_EC2_URL is empty")
+    req = urllib.request.Request(YOMITOKU_EC2_URL, data=blob, method="POST", headers={"Content-Type": content_type or "application/octet-stream"})
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
-            raw = r.read().decode("utf-8", errors="ignore")
-            data = json.loads(raw)
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"Yomitoku POST failed: {e.code} {detail}")
+            data = json.loads(r.read().decode("utf-8", errors="ignore"))
     except Exception as e:
         raise RuntimeError(f"Yomitoku request failed: {e}")
-
-    # 応答ゆれ吸収
+    pages = data.get("pages", []) or []
+    page_count = len(pages) if pages else 1
     for key in ["text", "ocr_text", "content", "markdown", "result"]:
         v = data.get(key)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-
+        if isinstance(v, str) and v.strip(): return v.strip(), page_count
     lines = []
-    for page in data.get("pages", []) or []:
+    for page in pages:
         for line in page.get("lines", []) or []:
             txt = line.get("text", "")
-            if txt:
-                lines.append(txt)
-
+            if txt: lines.append(txt)
     for block in data.get("blocks", []) or []:
         txt = block.get("text", "")
-        if txt:
-            lines.append(txt)
-
+        if txt: lines.append(txt)
     text = "\n".join(lines).strip()
-    if not text:
-        raise RuntimeError(f"Yomitoku returned empty text: {json.dumps(data, ensure_ascii=False)[:1000]}")
-    return text
+    if not text: raise RuntimeError("Yomitoku returned empty text")
+    return text, page_count
 
-def extract_ocr_text(blob: bytes, content_type: str, requested_engine: str = None) -> tuple[str, str]:
-    # 指定があれば優先、なければ環境変数を参照
-    engine = (requested_engine or OCR_ENGINE or "yomitoku_ec2").lower()
-
-    # YomiToku (EC2) 実行試行
+def extract_ocr_text(blob: bytes, content_type: str, requested_engine: str = None):
+    engine = (requested_engine or OCR_ENGINE or "azure").lower()
     if "yomitoku" in engine:
         try:
-            text = yomitoku_ec2_ocr(blob, content_type)
-            if text.strip():
-                return text, "YOMITOKU_EC2"
+            text, page_count = yomitoku_ec2_ocr(blob, content_type)
+            if text.strip(): return text, "YOMITOKU_EC2", page_count
         except Exception as e:
-            print(f"Yomitoku無反応または失敗。Azureに切り替えます: {e}")
+            print(f"Yomitoku failed, falling back to Azure: {e}")
+    text, page_count = azure_read_ocr(blob, content_type)
+    return text, "AZURE_VISION", page_count
 
-    # Azure実行（フォールバックまたは直接指定）
-    text = azure_read_ocr(blob, content_type)
-    return text, "AZURE_VISION"
 def handler(event, context):
     job_id = event.get("job_id")
     app_name = event.get("app_name", "")
     image_id = event.get("image_id", "")
     s3_key = event.get("s3_key", "")
 
-    if not job_id or not s3_key:
-        raise RuntimeError("job_id or s3_key missing")
+    if not job_id or not s3_key: raise RuntimeError("job_id or s3_key missing")
 
     jobs_t = ddb.Table(JOBS_TABLE)
     images_t = ddb.Table(IMAGES_TABLE)
 
     item = jobs_t.get_item(Key={"id": job_id}).get("Item") or {}
     st = item.get("status", "")
-
-    if st in ("DONE", "FAILED"):
-        return {"ok": True, "skipped": True, "status": st}
+    if st in ("DONE", "FAILED"): return {"ok": True, "skipped": True, "status": st}
 
     try:
         jobs_t.update_item(
@@ -218,69 +219,82 @@ def handler(event, context):
         content_type = obj.get("ContentType", "application/octet-stream")
 
         requested_engine = item.get("ocr_engine")
-        ocr_text, used_engine = extract_ocr_text(blob, content_type, requested_engine)
-        if not ocr_text.strip():
-            raise RuntimeError("OCR text is empty")
-
-        print("OCR_TEXT_HEAD:", (ocr_text or "")[:1000])
+        ocr_text, used_engine, page_count = extract_ocr_text(blob, content_type, requested_engine)
+        if not ocr_text.strip(): raise RuntimeError("OCR text is empty")
 
         raw_key = f"outputs/{job_id}/ocr_raw.txt"
-        s3.put_object(
-            Bucket=BUCKET,
-            Key=raw_key,
-            Body=ocr_text.encode("utf-8"),
-            ContentType="text/plain; charset=utf-8",
-        )
+        s3.put_object(Bucket=BUCKET, Key=raw_key, Body=ocr_text.encode("utf-8"), ContentType="text/plain; charset=utf-8")
 
-        out = call_claude(ocr_text)
+        out, llm_usage = call_claude(ocr_text)
         structured = out.get("structured", {})
         markdown = out.get("markdown", "")
 
-        js_key = f"outputs/{job_id}/structured.json"
-        md_key = f"outputs/{job_id}/output.md"
+        input_tokens = int(llm_usage.get("input_tokens", 0) or 0)
+        output_tokens = int(llm_usage.get("output_tokens", 0) or 0)
+        
+        # 💰 コスト計算ロジック（小数をDecimalに変換）
+        raw_cost = (input_tokens * 0.00045) + (output_tokens * 0.0022) + (page_count * 0.225)
+        cost_jpy = Decimal(str(round(raw_cost, 4)))
 
-        s3.put_object(
-            Bucket=BUCKET,
-            Key=js_key,
-            Body=json.dumps(structured, ensure_ascii=False).encode("utf-8"),
-            ContentType="application/json; charset=utf-8",
+        usage_metrics = {
+            "page_count": int(page_count or 0),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "ocr_engine": used_engine,
+            "cost_estimate_jpy": cost_jpy
+        }
+
+        s3.put_object(Bucket=BUCKET, Key=f"outputs/{job_id}/structured.json", Body=json.dumps(structured, ensure_ascii=False).encode("utf-8"), ContentType="application/json; charset=utf-8")
+        s3.put_object(Bucket=BUCKET, Key=f"outputs/{job_id}/output.md", Body=str(markdown).encode("utf-8"), ContentType="text/markdown; charset=utf-8")
+
+        record_usage_total(page_count, input_tokens, output_tokens, used_engine, cost_jpy)
+
+        current_month = datetime.now(timezone.utc).strftime('%Y-%m')
+        usage_t.update_item(
+        Key={"metric_date": current_month},
+        UpdateExpression="SET updated_at=:u ADD total_cost_jpy :cost",
+        ExpressionAttributeValues={":u": now(), ":cost": cost_jpy}
         )
-        s3.put_object(
-            Bucket=BUCKET,
-            Key=md_key,
-            Body=str(markdown).encode("utf-8"),
-            ContentType="text/markdown; charset=utf-8",
-        )
+
 
         jobs_t.update_item(
             Key={"id": job_id},
-            UpdateExpression="SET #st=:d, ocr_engine=:e, updated_at=:u",
+            UpdateExpression="SET #st=:d, ocr_engine=:e, updated_at=:u, page_count=:pc, input_tokens=:it, output_tokens=:ot, cost_estimate_jpy=:cost, usage_metrics=:um",
             ExpressionAttributeNames={"#st": "status"},
-            ExpressionAttributeValues={":d": "DONE", ":e": used_engine, ":u": now()},
+            ExpressionAttributeValues={
+                ":d": "DONE", ":e": used_engine, ":u": now(),
+                ":pc": int(page_count or 0), ":it": input_tokens, ":ot": output_tokens,
+                ":cost": cost_jpy, ":um": usage_metrics,
+            },
         )
 
         if app_name and image_id:
-            images_t.update_item(
-                Key={"app_name": app_name, "image_id": image_id},
-                UpdateExpression="SET #st=:d, updated_at=:u",
-                ExpressionAttributeNames={"#st": "status"},
-                ExpressionAttributeValues={":d": "completed", ":u": now()},
+            safe_update_image(
+                images_t, app_name, image_id,
+                update_expression="SET #st=:d, updated_at=:u, ocr_engine=:e, page_count=:pc, input_tokens=:it, output_tokens=:ot, cost_estimate_jpy=:cost, usage_metrics=:um",
+                expr_names={"#st": "status"},
+                expr_values={
+                    ":d": "completed", ":u": now(), ":e": used_engine,
+                    ":pc": int(page_count or 0), ":it": input_tokens, ":ot": output_tokens,
+                    ":cost": cost_jpy, ":um": usage_metrics,
+                },
             )
 
-        return {"ok": True, "job_id": job_id, "ocr_raw_key": raw_key, "used_engine": used_engine}
+        return {"ok": True, "job_id": job_id, "usage_metrics": json.loads(json.dumps(usage_metrics, default=float))}
 
     except Exception as e:
+        err_msg = corsafe(str(e))
         jobs_t.update_item(
             Key={"id": job_id},
             UpdateExpression="SET #st=:f, #err=:er, updated_at=:u",
             ExpressionAttributeNames={"#st": "status", "#err": "error"},
-            ExpressionAttributeValues={":f": "FAILED", ":er": corsafe(str(e)), ":u": now()},
+            ExpressionAttributeValues={":f": "FAILED", ":er": err_msg, ":u": now()},
         )
         if app_name and image_id:
-            images_t.update_item(
-                Key={"app_name": app_name, "image_id": image_id},
-                UpdateExpression="SET #st=:f, updated_at=:u",
-                ExpressionAttributeNames={"#st": "status"},
-                ExpressionAttributeValues={":f": "failed", ":u": now()},
+            safe_update_image(
+                images_t, app_name, image_id,
+                update_expression="SET #st=:f, updated_at=:u",
+                expr_names={"#st": "status"},
+                expr_values={":f": "failed", ":u": now()},
             )
         raise

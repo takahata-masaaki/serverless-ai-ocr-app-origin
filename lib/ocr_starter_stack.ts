@@ -55,6 +55,9 @@ export class OcrStarterStack extends cdk.Stack {
     api.root.addResource('images').addMethod('GET', new apigateway.LambdaIntegration(starterLambda));
     const ocr = api.root.addResource('ocr');
     ocr.addResource('start').addMethod('POST', new apigateway.LambdaIntegration(starterLambda));
+    const agent = ocr.addResource('agent');
+    agent.addResource('{image_id}')
+      .addMethod('POST', new apigateway.LambdaIntegration(starterLambda));
 
     // ===== apps API（今回追加）=====
     const apps = ocr.addResource('apps');

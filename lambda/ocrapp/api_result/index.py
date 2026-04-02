@@ -3,6 +3,12 @@ import json
 import boto3
 from datetime import datetime, timezone
 from botocore.exceptions import ClientError
+from decimal import Decimal
+
+class DecimalEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Decimal): return float(obj)
+        return super(DecimalEncoder, self).default(obj)
 
 REGION = os.getenv("AWS_REGION", "us-east-1")
 s3 = boto3.client("s3", region_name=REGION)
@@ -17,14 +23,14 @@ def _cors():
         "Content-Type": "application/json",
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Headers": "Content-Type,Authorization",
-        "Access-Control-Allow-Methods": "OPTIONS,GET",
+        "Access-Control-Allow-Methods": "OPTIONS,GET,DELETE",
     }
 
 def _resp(status_code: int, body: dict):
     return {
         "statusCode": status_code,
         "headers": _cors(),
-        "body": json.dumps(body, ensure_ascii=False),
+        "body": json.dumps(body, ensure_ascii=False, cls=DecimalEncoder),
     }
 
 def _presign_get(key: str, expires: int = 300) -> str:
@@ -35,22 +41,18 @@ def _presign_get(key: str, expires: int = 300) -> str:
     )
 
 def _parse_iso(s: str):
-    if not s:
-        return None
+    if not s: return None
     try:
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
+        if s.endswith("Z"): s = s[:-1] + "+00:00"
         dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
         return dt
     except Exception:
         return None
 
 def _is_timeout(upload_time: str, updated_at: str, limit_seconds: int = 600) -> bool:
     ref = _parse_iso(updated_at) or _parse_iso(upload_time)
-    if not ref:
-        return False
+    if not ref: return False
     return (datetime.now(timezone.utc) - ref).total_seconds() > limit_seconds
 
 def _head_exists(key: str) -> bool:
@@ -73,35 +75,17 @@ def _resolve_status(image_item: dict, job_item: dict):
     has_md = _head_exists(md_key)
     has_json = _head_exists(js_key)
 
-    # completed は4条件すべて必要
-    if (
-        raw_status == "completed" and
-        job_item and
-        job_status == "DONE" and
-        has_md and
-        has_json
-    ):
+    if (raw_status == "completed" and job_item and job_status == "DONE" and has_md and has_json):
         resolved = "completed"
-
-    # failed 明示
     elif raw_status == "failed" or job_status == "FAILED":
         resolved = "failed"
-
-    # processing のタイムアウト
     elif raw_status == "processing":
-        if _is_timeout(upload_time, updated_at, 600):
-            resolved = "failed"
-        else:
-            resolved = "processing"
-
-    # pending はそのまま
+        if _is_timeout(upload_time, updated_at, 600): resolved = "failed"
+        else: resolved = "processing"
     elif raw_status == "pending":
         resolved = "pending"
-
-    # completed っぽいが実体不足 → failed 扱い
     elif raw_status == "completed":
         resolved = "failed"
-
     else:
         resolved = raw_status or "pending"
 
@@ -120,9 +104,6 @@ def handler(event, context):
     path = event.get("pathParameters") or {}
     qs = event.get("queryStringParameters") or {}
 
-    # 後方互換:
-    # /ocr/result/{job_id}?app_name=...
-    # /ocr/result/{image_id}?app_name=...
     image_id = path.get("job_id") or path.get("image_id")
     app_name = qs.get("app_name") or path.get("app_name")
 
@@ -132,10 +113,7 @@ def handler(event, context):
     images_table = ddb.Table(IMAGES_TABLE)
     jobs_table = ddb.Table(JOBS_TABLE)
 
-    image_item = images_table.get_item(
-        Key={"app_name": app_name, "image_id": image_id}
-    ).get("Item")
-
+    image_item = images_table.get_item(Key={"app_name": app_name, "image_id": image_id}).get("Item")
     if not image_item:
         return _resp(404, {"error": "not found"})
 
@@ -165,7 +143,6 @@ def handler(event, context):
         resp["source_file_key"] = source_key
         resp["source_file_url"] = _presign_get(source_key)
 
-
     if status_info["has_output_md"]:
         md_key = f"outputs/{image_id}/output.md"
         resp["markdown_key"] = md_key
@@ -178,5 +155,19 @@ def handler(event, context):
 
     if job_item.get("error"):
         resp["error"] = job_item.get("error")
+
+    # 💡 画面のカウンター（ラベル）を表示させるための文字列ハック処理
+    try:
+        base_fn = resp.get("filename", "unknown.pdf").split(" ［")[0]
+        in_t = int(job_item.get("input_tokens", 0) or 0)
+        out_t = int(job_item.get("output_tokens", 0) or 0)
+        p_c = int(job_item.get("page_count", 1) or 1)
+        # コスト計算 (Input + Output + Page)
+        cost = (in_t * 0.00045) + (out_t * 0.0022) + (p_c * 0.225)
+        
+        # フロントエンドが期待しているフォーマットで上書き
+        resp["filename"] = f"{base_fn} ［約{cost:.3f}円 / {in_t}in, {out_t}out |Month:0.0］"
+    except Exception:
+        pass
 
     return _resp(200, resp)

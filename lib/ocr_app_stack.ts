@@ -9,53 +9,66 @@ export class OcrAppStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    // 1. 現存するリソース (あなたが確認した値を固定)
     const jobsTable = dynamodb.Table.fromTableName(this, 'JobsTable', 'OcrAppStack-DatabaseJobsTable7C20F61C-25WQGT70DRID');
     const docBucket = s3.Bucket.fromBucketName(this, 'DocBucket', 'ocrappstack-apidocumentbucket1e0f08d4-olnl5bocx2v3');
+    
+    // 💡【修正箇所】新規作成ではなく、既存のテーブル名を直接指定して参照する
+    const usageTable = dynamodb.Table.fromTableName(this, 'UsageMetricsTable', 'UsageMetricsTable');
 
-    // 2. 消失したテーブルをこのスタック内で再作成 
     const imagesTable = new dynamodb.Table(this, 'DatabaseImagesTable', {
       partitionKey: { name: 'app_name', type: dynamodb.AttributeType.STRING },
       sortKey: { name: 'image_id', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      removalPolicy: cdk.RemovalPolicy.DESTROY, 
     });
 
-    const schemasTable = new dynamodb.Table(this, 'DatabaseSchemasTable', {
-      partitionKey: { name: 'name', type: dynamodb.AttributeType.STRING },
-      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-    });
-
-    // 3. Lambda 用の共通環境変数
     const commonEnv = {
       BUCKET_NAME: docBucket.bucketName,
       JOBS_TABLE_NAME: jobsTable.tableName,
       IMAGES_TABLE_NAME: imagesTable.tableName,
-      SCHEMAS_TABLE_NAME: schemasTable.tableName,
-      ENABLE_OCR: 'true'
+      USAGE_METRICS_TABLE_NAME: usageTable.tableName,
+      ENABLE_OCR: 'true',
+      OCR_ENGINE: 'azure'
     };
 
-    // 4. 既存の Lambda 関数を定義 (または新規作成として定義)
-    const apiStart = new lambda.Function(this, 'ApiStartFunction', {
+    const ocrWorker = new lambda.Function(this, 'ApiWorkerFunctionRebuild', {
       runtime: lambda.Runtime.PYTHON_3_11,
       handler: 'index.handler',
-      code: lambda.Code.fromAsset('lambda/api/start'),
+      code: lambda.Code.fromAsset('lambda/ocrapp/ocr_worker'),
+      environment: commonEnv,
+      timeout: cdk.Duration.minutes(5),
+      reservedConcurrentExecutions: 5
+    });
+
+    const apiResult = new lambda.Function(this, 'ApiResultFunction', {
+      runtime: lambda.Runtime.PYTHON_3_11,
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset('lambda/ocrapp/api_result'),
       environment: commonEnv
     });
 
-    // 権限付与
-    jobsTable.grantReadWriteData(apiStart);
-    imagesTable.grantReadWriteData(apiStart);
-    docBucket.grantReadWrite(apiStart);
+    // ここで既存の UsageMetricsTable に対するアクセス権限が正しく付与されます
+    jobsTable.grantReadWriteData(ocrWorker);
+    jobsTable.grantReadWriteData(apiResult);
+    imagesTable.grantReadWriteData(ocrWorker);
+    imagesTable.grantReadWriteData(apiResult);
+    usageTable.grantReadWriteData(ocrWorker);
+    usageTable.grantReadWriteData(apiResult);
+    docBucket.grantReadWrite(ocrWorker);
+    docBucket.grantReadWrite(apiResult);
 
-    // 5. API Gateway
     const api = new apigateway.RestApi(this, 'OcrApi', {
       defaultCorsPreflightOptions: {
         allowOrigins: apigateway.Cors.ALL_ORIGINS,
         allowMethods: apigateway.Cors.ALL_METHODS,
       }
     });
-    api.root.addResource('ocr').addResource('start').addMethod('POST', new apigateway.LambdaIntegration(apiStart));
+    
+    const ocrRes = api.root.addResource('ocr');
+    const resultRes = ocrRes.addResource('result');
+    const imageIdRes = resultRes.addResource('{image_id}');
+    
+    imageIdRes.addMethod('GET', new apigateway.LambdaIntegration(apiResult));
+    imageIdRes.addMethod('DELETE', new apigateway.LambdaIntegration(apiResult));
   }
 }

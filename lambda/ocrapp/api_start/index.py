@@ -3,6 +3,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 import boto3
+from boto3.dynamodb.conditions import Key
 
 REGION = os.getenv("AWS_REGION", "us-east-1")
 s3 = boto3.client("s3", region_name=REGION)
@@ -167,7 +168,66 @@ def _handle_ocr_start(body):
         except Exception as e: errors.append({"image_id": image_id, "error": str(e)})
     return _resp(200, {"message": "OCR dispatch completed", "app_name": app_name, "started": len(started), "items": started, "errors": errors})
 
+
+def _json_response(status_code: int, body):
+    return {
+        "statusCode": status_code,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token",
+            "Access-Control-Allow-Methods": "OPTIONS,GET,POST,PUT,DELETE",
+        },
+        "body": json.dumps(body, ensure_ascii=False),
+    }
+
+def _handle_safe_images_list(event):
+    qs = event.get("queryStringParameters") or {}
+    app_name = (qs.get("app_name") or "").strip()
+    if not app_name:
+        return _json_response(400, {"message": "app_name is required"})
+
+    table_name = os.environ["IMAGES_TABLE_NAME"]
+    t = boto3.resource("dynamodb", region_name=REGION).Table(table_name)
+
+    resp = t.query(
+        KeyConditionExpression=Key("app_name").eq(app_name)
+    )
+
+    rows = []
+    for item in resp.get("Items", []):
+        image_id = item.get("image_id")
+        if not image_id:
+            continue
+
+        rows.append({
+            "app_name": item.get("app_name", ""),
+            "image_id": image_id,
+            "filename": item.get("filename") or item.get("name") or "",
+            "name": item.get("name") or item.get("filename") or "",
+            "s3_key": item.get("s3_key", ""),
+            "status": item.get("status", "pending"),
+            "ocr_engine": item.get("ocr_engine", ""),
+            "page_processing_mode": item.get("page_processing_mode", "combined"),
+            "uploadTime": item.get("uploadTime", ""),
+            "updated_at": item.get("updated_at", ""),
+            "job_id": item.get("job_id", ""),
+        })
+
+    rows.sort(key=lambda x: (x.get("uploadTime") or x.get("updated_at") or ""), reverse=True)
+    return _json_response(200, {"images": rows})
+
+
 def handler(event, context):
+    http_method = (
+        event.get("httpMethod")
+        or event.get("requestContext", {}).get("http", {}).get("method")
+        or ""
+    ).upper()
+    path = event.get("rawPath") or event.get("path") or ""
+
+    if http_method == "GET" and path.endswith("/images") and not path.endswith("/images/"):
+        return _handle_safe_images_list(event)
     method, path = event.get("httpMethod", ""), event.get("path", "")
     if method == "OPTIONS": return {"statusCode": 204, "headers": _cors(), "body": ""}
     qs, body = event.get("queryStringParameters") or {}, _json_body(event)
