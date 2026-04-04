@@ -1,0 +1,81 @@
+export interface ImageFile {
+    image_id: string;
+    name: string;
+    s3_key: string;
+    uploadTime: string;
+    status: 'uploading' | 'pending' | 'processing' | 'completed' | 'failed';
+    jobId?: string;
+    appName?: string;
+    app_name?: string;
+    pageProcessingMode?: 'combined' | 'individual';
+    pageNumber?: number;
+    totalPages?: number;
+    parentDocumentId?: string;
+    verificationCompleted?: boolean;
+}
+export interface OcrWord {
+    content: string;
+    rec_score?: number;
+    det_score?: number;
+    points?: number[][];
+    id?: number;
+    page?: number;
+}
+export interface OcrResultData extends OcrWord {
+}
+export interface OcrBoundingBox {
+    id: number;
+    top: number;
+    left: number;
+    width: number;
+    height: number;
+    text: string;
+}
+export interface OcrResponse {
+    filename: string;
+    s3_key: string;
+    uploadTime: string;
+    json_url?: string;
+    markdown_url?: string;
+    status: string;
+    ocrResult: {
+        words: OcrWord[];
+    };
+    imageUrl: string;
+}
+export interface OcrStartResponse {
+    jobId: string;
+}
+export interface PresignedUrlResponse {
+    presigned_url: string;
+    s3_key: string;
+    image_id: string;
+}
+export interface UploadCompleteResponse {
+    status: string;
+    message: string;
+    image_id: string;
+    is_converting?: boolean;
+    page_processing_mode?: 'combined' | 'individual';
+}
+export interface OcrStatusResponse {
+    status: string;
+    images: {
+        image_id: string;
+        filename: string;
+        status: string;
+    }[];
+}
+export interface PresignedDownloadUrlResponse {
+    presigned_url: string;
+    presigned_urls: Array<{
+        page: number;
+        presigned_url: string;
+        s3_key: string;
+    }>;
+    total_pages: number;
+    is_multipage: boolean;
+    content_type: string;
+    filename: string;
+    is_converted: boolean;
+}
