@@ -14,7 +14,7 @@ export class OcrStarterStack extends cdk.Stack {
     const docBucket = s3.Bucket.fromBucketName(this, 'DocBucket', 'ocrappstack-apidocumentbucket1e0f08d4-olnl5bocx2v3');
     const imagesTable = dynamodb.Table.fromTableName(this, 'ImagesTable', 'OcrStarterStack-DatabaseImagesTable50A0FC36-DUJU7RD1D23Z');
     const schemasTable = dynamodb.Table.fromTableName(this, 'SchemasTable', 'OcrStarterStack-DatabaseSchemasTableBFF5A513-1O9ELJON6XISM');
-
+    
     // 実働部隊（Worker）の参照
     const workerLambda = lambda.Function.fromFunctionName(this, 'WorkerLambda', 'OcrAppStack-ApiWorkerFunctionRebuildDDC688FF-Q8iUloBfPyAw');
 
@@ -38,7 +38,7 @@ export class OcrStarterStack extends cdk.Stack {
     jobsTable.grantReadWriteData(starterLambda);
     imagesTable.grantReadWriteData(starterLambda);
     schemasTable.grantReadData(starterLambda);
-
+    
     // ★受付係に、実働部隊を呼び出す(Invoke)権限を付与
     workerLambda.grantInvoke(starterLambda);
 
@@ -55,12 +55,10 @@ export class OcrStarterStack extends cdk.Stack {
     api.root.addResource('images').addMethod('GET', new apigateway.LambdaIntegration(starterLambda));
     const ocr = api.root.addResource('ocr');
     ocr.addResource('start').addMethod('POST', new apigateway.LambdaIntegration(starterLambda));
-    const agent = ocr.addResource('agent');
-    agent.addResource('{image_id}')
-      .addMethod('POST', new apigateway.LambdaIntegration(starterLambda));
 
     // ===== apps API（今回追加）=====
     const apps = ocr.addResource('apps');
+
     apps.addMethod('GET', new apigateway.LambdaIntegration(starterLambda));
     apps.addMethod('POST', new apigateway.LambdaIntegration(starterLambda));
 
@@ -71,8 +69,6 @@ export class OcrStarterStack extends cdk.Stack {
     const appItem = apps.addResource('{app_name}');
     appItem.addMethod('GET', new apigateway.LambdaIntegration(starterLambda));
     appItem.addMethod('PUT', new apigateway.LambdaIntegration(starterLambda));
-    // 💡【修正】正規ルートに対するDELETEメソッドを許可
-    appItem.addMethod('DELETE', new apigateway.LambdaIntegration(starterLambda));
 
     const appSchema = appItem.addResource('schema');
     appSchema.addMethod('GET', new apigateway.LambdaIntegration(starterLambda));

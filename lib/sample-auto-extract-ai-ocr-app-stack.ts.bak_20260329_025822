@@ -42,12 +42,6 @@ export class SampleAutoExtractAiOcrAppStack extends cdk.Stack {
     const jobsTable = dynamodb.Table.fromTableName(this, 'JobsTable', jobsTableName.valueAsString);
     const imagesTable = dynamodb.Table.fromTableName(this, 'ImagesTable', imagesTableName.valueAsString);
 
-    const usageMetricsTable = new dynamodb.Table(this, 'UsageMetricsTable', {
-      partitionKey: { name: 'metric_date', type: dynamodb.AttributeType.STRING },
-      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      removalPolicy: cdk.RemovalPolicy.RETAIN,
-    });
-
     // ---- Lambdas ----
     const apiStart = new lambda.Function(this, 'ApiStartFunction', {
       runtime: lambda.Runtime.PYTHON_3_11,
@@ -84,12 +78,10 @@ export class SampleAutoExtractAiOcrAppStack extends cdk.Stack {
       environment: {
         BUCKET_NAME: bucketName.valueAsString,
         JOBS_TABLE_NAME: jobsTableName.valueAsString,
-        IMAGES_TABLE_NAME: imagesTableName.valueAsString,
         MODEL_ID: modelId.valueAsString,
         MODEL_REGION: modelRegion.valueAsString,
         LLM_MAX_CHARS: '12000',
         LLM_MAX_TOKENS: '1200',
-        USAGE_METRICS_TABLE_NAME: usageMetricsTable.tableName,
       },
     });
 
@@ -115,7 +107,6 @@ export class SampleAutoExtractAiOcrAppStack extends cdk.Stack {
     ocrWorker.grantInvoke(apiStart);
     jobsTable.grantReadWriteData(uploadWorker);
     jobsTable.grantReadWriteData(ocrWorker);
-    usageMetricsTable.grantReadWriteData(ocrWorker);
 
     bucket.grantPut(apiStart, 'uploads/*');
     bucket.grantReadWrite(apiStart, 'schemas/*');
