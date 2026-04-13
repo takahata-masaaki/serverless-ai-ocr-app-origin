@@ -19,6 +19,7 @@ export class OcrStarterStack extends cdk.Stack {
     const workerLambda = lambda.Function.fromFunctionName(this, 'WorkerLambda', 'OcrAppStack-ApiWorkerFunctionRebuildDDC688FF-Q8iUloBfPyAw');
 
     const starterLambda = new lambda.Function(this, 'StarterLambda', {
+      reservedConcurrentExecutions: 1,
       runtime: lambda.Runtime.PYTHON_3_11,
       handler: 'index.handler',
       code: lambda.Code.fromAsset('lambda/starter'),

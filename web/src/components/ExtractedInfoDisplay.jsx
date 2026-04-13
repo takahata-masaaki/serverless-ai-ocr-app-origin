@@ -58,46 +58,6 @@ const ExtractedInfoDisplay = ({ extractedInfo, fields, onSave, onHighlightField,
     const handleShowTools = () => {
         setShowToolsModal(true);
     };
-
-    const getDisplayLabel = (field) => {
-        const name = field?.name || '';
-        if (name === 'document_title') return '書類タイトル';
-        if (name === 'date' || name === 'document_date') return '日付';
-        return field?.description || field?.label || name || '項目';
-    };
-
-    const getItemLabel = (itemFieldName) => {
-        if (itemFieldName === 'name') return '項目名';
-        if (itemFieldName === 'value') return '内容';
-        return itemFieldName || '項目';
-    };
-
-    const renderAgentSuggestionsList = () => {
-        if (!agentSuggestions || agentSuggestions.length === 0) return null;
-
-        return (
-            <div className="mt-4 p-4 bg-blue-50 border border-blue-200 rounded-lg">
-                <h3 className="text-sm font-semibold text-blue-900 mb-3">AI修正提案</h3>
-                <div className="space-y-3">
-                    {agentSuggestions.map((s, i) => (
-                        <div key={i} className="bg-white border border-blue-100 rounded p-3">
-                            <div className="text-sm font-medium text-blue-900">
-                                {s.label || s.type || '提案'}
-                            </div>
-                            <div className="text-sm text-gray-900 mt-1">
-                                {s.value || '(提案値なし)'}
-                            </div>
-                            {s.reason && (
-                                <div className="text-xs text-gray-600 mt-1">
-                                    {s.reason}
-                                </div>
-                            )}
-                        </div>
-                    ))}
-                </div>
-            </div>
-        );
-    };
     // 提案を採用
     const handleAcceptSuggestion = (suggestion) => {
         // 編集モードでない場合は確認ダイアログを表示
@@ -231,7 +191,7 @@ const ExtractedInfoDisplay = ({ extractedInfo, fields, onSave, onHighlightField,
     const renderStringField = (field) => {
         const value = editMode ? editedInfo[field.name] : extractedInfo[field.name];
         const suggestion = getSuggestionForField(field.name);
-        return (<div key={getDisplayLabel(field)} className="mb-4">
+        return (<div key={field.name} className="mb-4">
         <div className="flex justify-between items-center mb-1">
           <label className="block text-sm font-medium text-gray-700">
             {field.display_name} {suggestion && <span className="text-yellow-600">⚠</span>}
@@ -257,11 +217,11 @@ const ExtractedInfoDisplay = ({ extractedInfo, fields, onSave, onHighlightField,
         if (!field.fields)
             return null;
         const mapValue = editMode ? editedInfo[field.name] || {} : extractedInfo[field.name] || {};
-        return (<div key={getDisplayLabel(field)} className="mb-6">
+        return (<div key={field.name} className="mb-6">
         <h3 className="text-lg font-medium mb-2">{field.display_name}</h3>
         <div className="pl-4 border-l-2 border-gray-200 space-y-3">
           {field.fields.map(subField => {
-                const fieldPath = `${getDisplayLabel(field)}.${subField.name}`;
+                const fieldPath = `${field.name}.${subField.name}`;
                 const suggestion = getSuggestionForField(fieldPath);
                 return (<div key={subField.name} className="mb-3">
                 <div className="flex justify-between items-center mb-1">
@@ -294,7 +254,7 @@ const ExtractedInfoDisplay = ({ extractedInfo, fields, onSave, onHighlightField,
         const listData = editMode ? editedInfo[field.name] || [] : extractedInfo[field.name] || [];
         // マップ型のリストの場合
         if (field.items.type === 'map' && field.items.fields) {
-            return (<div key={getDisplayLabel(field)} className="mb-6">
+            return (<div key={field.name} className="mb-6">
           <h3 className="text-lg font-medium mb-2">{field.display_name}</h3>
           
           <div className="overflow-x-auto">
@@ -342,7 +302,7 @@ const ExtractedInfoDisplay = ({ extractedInfo, fields, onSave, onHighlightField,
         </div>);
         }
         // 単純なリストの場合
-        return (<div key={getDisplayLabel(field)} className="mb-6">
+        return (<div key={field.name} className="mb-6">
         <h3 className="text-lg font-medium mb-2">{field.display_name}</h3>
         <ul className="list-disc pl-5">
           {listData.map((item, itemIndex) => (<li key={itemIndex} className="mb-2">
@@ -387,6 +347,10 @@ const ExtractedInfoDisplay = ({ extractedInfo, fields, onSave, onHighlightField,
               {onRunAgent && isAgentEnabled() && (<>
                   <div className="h-8 w-px bg-gray-300"></div>
                   
+                  {/* 高度な機能 */}
+                  <button onClick={handleShowTools} className="px-3 py-2 rounded border border-gray-300 hover:bg-gray-50 text-gray-700 text-sm">
+                    登録ツール一覧
+                  </button>
                   <button onClick={handleRunAgent} disabled={agentStatus === 'running'} className={`px-3 py-2 rounded border text-sm ${agentStatus === 'running'
                     ? 'border-gray-300 bg-gray-100 text-gray-400 cursor-not-allowed'
                     : 'border-purple-300 hover:bg-purple-50 text-purple-700'}`}>
@@ -394,13 +358,13 @@ const ExtractedInfoDisplay = ({ extractedInfo, fields, onSave, onHighlightField,
                   </button>
                 </>)}
             </div>
-
-            {agentSuggestions && agentSuggestions.length > 0 && renderAgentSuggestionsList()}
             
             {/* 確認完了チェックボックス */}
             <div className="flex items-center gap-2 whitespace-nowrap">
               <input type="checkbox" id="verification-complete" checked={verificationCompleted} onChange={(e) => onVerificationChange?.(e.target.checked)} className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"/>
-              <label htmlFor="verification-complete" className="text-sm text-gray-700 cursor-pointer"> 確認を完了 </label>
+              <label htmlFor="verification-complete" className="text-sm text-gray-700 cursor-pointer">
+                確認完了
+              </label>
             </div>
           </div>)}
       </div>
@@ -421,7 +385,7 @@ const ExtractedInfoDisplay = ({ extractedInfo, fields, onSave, onHighlightField,
               {tools.map((tool, index) => (<div key={index} className="p-3 border border-gray-200 rounded">
                   <div className="font-semibold text-gray-800">{tool.name}</div>
                   <div className="text-sm text-gray-600 mt-1">{tool.description}</div>
-            </div>))}
+                </div>))}
             </div>
           </div>
         </div>)}

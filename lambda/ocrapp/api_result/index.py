@@ -33,7 +33,7 @@ def _resp(status_code: int, body: dict):
         "body": json.dumps(body, ensure_ascii=False, cls=DecimalEncoder),
     }
 
-def _presign_get(key: str, expires: int = 300) -> str:
+def _presign_get(key: str, expires: int = 3600) -> str:
     return s3.generate_presigned_url(
         "get_object",
         Params={"Bucket": BUCKET, "Key": key},

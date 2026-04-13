@@ -1,4 +1,4 @@
-import { createBrowserRouter, Outlet } from 'react-router-dom';
+import { createHashRouter, Outlet } from 'react-router-dom';
 
 import App from './App';
 import { AppProvider } from './components/AppContext';
@@ -8,7 +8,7 @@ import Upload from './pages/Upload';
 import OCRResult from './pages/OCRResult';
 import SchemaGenerator from './pages/SchemaGenerator';
 
-const router = createBrowserRouter([
+const router = createHashRouter([
   {
     path: '/',
     element: (

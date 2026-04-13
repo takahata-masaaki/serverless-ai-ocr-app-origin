@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import api from '../utils/api';
-const AppContext = createContext({
+export const AppContext = createContext({
     apps: [],
     loading: false,
     error: null,

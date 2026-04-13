@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import time
 import urllib.request
 import urllib.error
@@ -35,6 +36,7 @@ br = boto3.client("bedrock-runtime", region_name=MODEL_REGION)
 
 usage_t = ddb.Table(USAGE_TABLE)
 
+
 def safe_update_image(images_t, app_name, image_id, *, update_expression, expr_names, expr_values):
     try:
         images_t.update_item(
@@ -51,11 +53,14 @@ def safe_update_image(images_t, app_name, image_id, *, update_expression, expr_n
             return
         raise
 
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
+
 def corsafe(s: str) -> str:
     return (s or "")[:900]
+
 
 def record_usage_total(page_count: int, input_tokens: int, output_tokens: int, used_engine: str, cost_jpy: Decimal):
     add_parts = [
@@ -86,8 +91,33 @@ def record_usage_total(page_count: int, input_tokens: int, output_tokens: int, u
         },
     )
 
+
+
+def safe_parse_json(text: str):
+    raw = (text or "").strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = raw[start:end+1]
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+
+    print("WARNING: Claude JSON parse failed. Returning empty object.")
+    print("RAW_HEAD=", raw[:500])
+    return {}
+
 def call_claude(ocr_text: str):
-    if not MODEL_ID: raise RuntimeError("MODEL_ID is empty")
+    if not MODEL_ID:
+        raise RuntimeError("MODEL_ID is empty")
+
     ocr_text = (ocr_text or "")[:LLM_MAX_CHARS]
     prompt = (
         "あなたの仕事はOCR結果を整形することだけです。\n"
@@ -115,81 +145,252 @@ def call_claude(ocr_text: str):
     if out_text.startswith("```"):
         out_text = out_text.strip("`")
         out_text = out_text[out_text.find("\n") + 1:].strip()
-    parsed = json.loads(out_text)
+    parsed = safe_parse_json(out_text)
     usage = payload.get("usage") or {}
     return parsed, {
         "input_tokens": int(usage.get("input_tokens", 0) or 0),
         "output_tokens": int(usage.get("output_tokens", 0) or 0),
     }
 
+
+def _to_num(v):
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        f = float(v)
+    elif isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            f = float(s)
+        except Exception:
+            return None
+    else:
+        return None
+
+    if f.is_integer():
+        return int(f)
+    return f
+
+
+def _pair_from_dict(d):
+    if not isinstance(d, dict):
+        return []
+
+    if "x" in d and "y" in d:
+        x = _to_num(d.get("x"))
+        y = _to_num(d.get("y"))
+        return [x, y] if x is not None and y is not None else []
+
+    if "X" in d and "Y" in d:
+        x = _to_num(d.get("X"))
+        y = _to_num(d.get("Y"))
+        return [x, y] if x is not None and y is not None else []
+
+    if "left" in d and "top" in d:
+        x = _to_num(d.get("left"))
+        y = _to_num(d.get("top"))
+        return [x, y] if x is not None and y is not None else []
+
+    return []
+
+
+def normalize_points(raw):
+    if raw is None:
+        return []
+
+    if isinstance(raw, dict):
+        for key in ("points", "boundingBox", "polygon"):
+            if key in raw:
+                return normalize_points(raw.get(key))
+        pair = _pair_from_dict(raw)
+        return pair if pair else []
+
+    if not isinstance(raw, (list, tuple)):
+        return []
+
+    out = []
+    for item in raw:
+        if isinstance(item, dict):
+            pair = _pair_from_dict(item)
+            if pair:
+                out.extend(pair)
+            continue
+
+        if isinstance(item, (list, tuple)):
+            if len(item) >= 2:
+                x = _to_num(item[0])
+                y = _to_num(item[1])
+                if x is not None and y is not None:
+                    out.extend([x, y])
+            else:
+                for sub in item:
+                    n = _to_num(sub)
+                    if n is not None:
+                        out.append(n)
+            continue
+
+        n = _to_num(item)
+        if n is not None:
+            out.append(n)
+
+    if len(out) >= 4 and len(out) % 2 == 0:
+        return out
+    return []
+
+
+def _make_overlay_entry(text, raw_points):
+    txt = (text or "").strip()
+    if not txt:
+        return None
+    points = normalize_points(raw_points)
+    if not points:
+        return None
+    return {"text": txt, "points": points}
+
+
+def _collect_overlay_lines_from_pages(pages):
+    rows = []
+    for page in pages or []:
+        for line in page.get("lines", []) or []:
+            entry = _make_overlay_entry(
+                line.get("text", ""),
+                line.get("boundingBox") or line.get("polygon") or line.get("points"),
+            )
+            if entry:
+                rows.append(entry)
+    return rows
+
+
+def _collect_overlay_lines_from_blocks(blocks):
+    rows = []
+    for block in blocks or []:
+        entry = _make_overlay_entry(
+            block.get("text", ""),
+            block.get("boundingBox") or block.get("polygon") or block.get("points"),
+        )
+        if entry:
+            rows.append(entry)
+    return rows
+
+
 def azure_read_ocr(blob: bytes, content_type: str):
     if not AZURE_VISION_ENDPOINT or not AZURE_VISION_KEY:
         raise RuntimeError("AZURE_VISION_ENDPOINT or AZURE_VISION_KEY is empty")
+
     analyze_url = f"{AZURE_VISION_ENDPOINT}/vision/{AZURE_VISION_API_VERSION}/read/analyze"
-    req = urllib.request.Request(analyze_url, data=blob, method="POST", headers={"Ocp-Apim-Subscription-Key": AZURE_VISION_KEY, "Content-Type": content_type or "application/octet-stream"})
+    req = urllib.request.Request(
+        analyze_url,
+        data=blob,
+        method="POST",
+        headers={
+            "Ocp-Apim-Subscription-Key": AZURE_VISION_KEY,
+            "Content-Type": content_type or "application/octet-stream"
+        },
+    )
+
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             op_loc = r.headers.get("Operation-Location")
-            if not op_loc: raise RuntimeError("Azure Operation-Location header missing")
+            if not op_loc:
+                raise RuntimeError("Azure Operation-Location header missing")
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"Azure POST failed: {e.code} {e.read().decode('utf-8', errors='ignore')}")
 
     for _ in range(30):
         time.sleep(2)
-        poll_req = urllib.request.Request(op_loc, method="GET", headers={"Ocp-Apim-Subscription-Key": AZURE_VISION_KEY})
+        poll_req = urllib.request.Request(
+            op_loc,
+            method="GET",
+            headers={"Ocp-Apim-Subscription-Key": AZURE_VISION_KEY},
+        )
         try:
             with urllib.request.urlopen(poll_req, timeout=60) as r:
                 data = json.loads(r.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             raise RuntimeError(f"Azure poll failed: {e.code} {e.read().decode('utf-8', errors='ignore')}")
+
         status = (data.get("status") or "").lower()
         if status == "succeeded":
-            lines = []
             pages = data.get("analyzeResult", {}).get("readResults", []) or []
             page_count = len(pages) if pages else 1
+            overlay_lines = _collect_overlay_lines_from_pages(pages)
+
+            text_lines = []
             for page in pages:
-                for line in page.get("lines", []):
-                    text = line.get("text", "")
-                    if text: lines.append(text)
-            return "\n".join(lines).strip(), page_count
-        if status == "failed": raise RuntimeError(f"Azure OCR failed: {json.dumps(data, ensure_ascii=False)}")
+                for line in page.get("lines", []) or []:
+                    text = (line.get("text") or "").strip()
+                    if text:
+                        text_lines.append(text)
+
+            return "\n".join(text_lines).strip(), page_count, overlay_lines
+
+        if status == "failed":
+            raise RuntimeError(f"Azure OCR failed: {json.dumps(data, ensure_ascii=False)}")
+
     raise RuntimeError("Azure OCR polling timeout")
 
+
 def yomitoku_ec2_ocr(blob: bytes, content_type: str):
-    if not YOMITOKU_EC2_URL: raise RuntimeError("YOMITOKU_EC2_URL is empty")
-    req = urllib.request.Request(YOMITOKU_EC2_URL, data=blob, method="POST", headers={"Content-Type": content_type or "application/octet-stream"})
+    if not YOMITOKU_EC2_URL:
+        raise RuntimeError("YOMITOKU_EC2_URL is empty")
+
+    req = urllib.request.Request(
+        YOMITOKU_EC2_URL,
+        data=blob,
+        method="POST",
+        headers={"Content-Type": content_type or "application/octet-stream"},
+    )
+
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
             data = json.loads(r.read().decode("utf-8", errors="ignore"))
     except Exception as e:
         raise RuntimeError(f"Yomitoku request failed: {e}")
+
     pages = data.get("pages", []) or []
     page_count = len(pages) if pages else 1
+    overlay_lines = _collect_overlay_lines_from_pages(pages)
+    overlay_lines.extend(_collect_overlay_lines_from_blocks(data.get("blocks", []) or []))
+
     for key in ["text", "ocr_text", "content", "markdown", "result"]:
         v = data.get(key)
-        if isinstance(v, str) and v.strip(): return v.strip(), page_count
-    lines = []
+        if isinstance(v, str) and v.strip():
+            return v.strip(), page_count, overlay_lines
+
+    text_lines = []
     for page in pages:
         for line in page.get("lines", []) or []:
-            txt = line.get("text", "")
-            if txt: lines.append(txt)
+            txt = (line.get("text") or "").strip()
+            if txt:
+                text_lines.append(txt)
+
     for block in data.get("blocks", []) or []:
-        txt = block.get("text", "")
-        if txt: lines.append(txt)
-    text = "\n".join(lines).strip()
-    if not text: raise RuntimeError("Yomitoku returned empty text")
-    return text, page_count
+        txt = (block.get("text") or "").strip()
+        if txt:
+            text_lines.append(txt)
+
+    text = "\n".join(text_lines).strip()
+    if not text:
+        raise RuntimeError("Yomitoku returned empty text")
+
+    return text, page_count, overlay_lines
+
 
 def extract_ocr_text(blob: bytes, content_type: str, requested_engine: str = None):
     engine = (requested_engine or OCR_ENGINE or "azure").lower()
     if "yomitoku" in engine:
         try:
-            text, page_count = yomitoku_ec2_ocr(blob, content_type)
-            if text.strip(): return text, "YOMITOKU_EC2", page_count
+            text, page_count, overlay_lines = yomitoku_ec2_ocr(blob, content_type)
+            if text.strip():
+                return text, "YOMITOKU_EC2", page_count, overlay_lines
         except Exception as e:
             print(f"Yomitoku failed, falling back to Azure: {e}")
-    text, page_count = azure_read_ocr(blob, content_type)
-    return text, "AZURE_VISION", page_count
+
+    text, page_count, overlay_lines = azure_read_ocr(blob, content_type)
+    return text, "AZURE_VISION", page_count, overlay_lines
+
 
 def handler(event, context):
     job_id = event.get("job_id")
@@ -197,14 +398,16 @@ def handler(event, context):
     image_id = event.get("image_id", "")
     s3_key = event.get("s3_key", "")
 
-    if not job_id or not s3_key: raise RuntimeError("job_id or s3_key missing")
+    if not job_id or not s3_key:
+        raise RuntimeError("job_id or s3_key missing")
 
     jobs_t = ddb.Table(JOBS_TABLE)
     images_t = ddb.Table(IMAGES_TABLE)
 
     item = jobs_t.get_item(Key={"id": job_id}).get("Item") or {}
     st = item.get("status", "")
-    if st in ("DONE", "FAILED"): return {"ok": True, "skipped": True, "status": st}
+    if st in ("DONE", "FAILED"):
+        return {"ok": True, "skipped": True, "status": st}
 
     try:
         jobs_t.update_item(
@@ -219,20 +422,35 @@ def handler(event, context):
         content_type = obj.get("ContentType", "application/octet-stream")
 
         requested_engine = item.get("ocr_engine")
-        ocr_text, used_engine, page_count = extract_ocr_text(blob, content_type, requested_engine)
-        if not ocr_text.strip(): raise RuntimeError("OCR text is empty")
+        ocr_text, used_engine, page_count, overlay_lines = extract_ocr_text(blob, content_type, requested_engine)
+        if not ocr_text.strip():
+            raise RuntimeError("OCR text is empty")
 
         raw_key = f"outputs/{job_id}/ocr_raw.txt"
-        s3.put_object(Bucket=BUCKET, Key=raw_key, Body=ocr_text.encode("utf-8"), ContentType="text/plain; charset=utf-8")
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=raw_key,
+            Body=ocr_text.encode("utf-8"),
+            ContentType="text/plain; charset=utf-8",
+        )
 
         out, llm_usage = call_claude(ocr_text)
         structured = out.get("structured", {})
+        if not isinstance(structured, dict):
+            structured = {"value": structured}
         markdown = out.get("markdown", "")
+
+        if overlay_lines:
+            structured["ocr_overlay"] = {
+                "version": 1,
+                "engine": used_engine,
+                "unit": "polygon",
+                "lines": overlay_lines,
+            }
 
         input_tokens = int(llm_usage.get("input_tokens", 0) or 0)
         output_tokens = int(llm_usage.get("output_tokens", 0) or 0)
-        
-        # 💰 コスト計算ロジック（小数をDecimalに変換）
+
         raw_cost = (input_tokens * 0.00045) + (output_tokens * 0.0022) + (page_count * 0.225)
         cost_jpy = Decimal(str(round(raw_cost, 4)))
 
@@ -244,18 +462,27 @@ def handler(event, context):
             "cost_estimate_jpy": cost_jpy
         }
 
-        s3.put_object(Bucket=BUCKET, Key=f"outputs/{job_id}/structured.json", Body=json.dumps(structured, ensure_ascii=False).encode("utf-8"), ContentType="application/json; charset=utf-8")
-        s3.put_object(Bucket=BUCKET, Key=f"outputs/{job_id}/output.md", Body=str(markdown).encode("utf-8"), ContentType="text/markdown; charset=utf-8")
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=f"outputs/{job_id}/structured.json",
+            Body=json.dumps(structured, ensure_ascii=False).encode("utf-8"),
+            ContentType="application/json; charset=utf-8",
+        )
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=f"outputs/{job_id}/output.md",
+            Body=str(markdown).encode("utf-8"),
+            ContentType="text/markdown; charset=utf-8",
+        )
 
         record_usage_total(page_count, input_tokens, output_tokens, used_engine, cost_jpy)
 
         current_month = datetime.now(timezone.utc).strftime('%Y-%m')
         usage_t.update_item(
-        Key={"metric_date": current_month},
-        UpdateExpression="SET updated_at=:u ADD total_cost_jpy :cost",
-        ExpressionAttributeValues={":u": now(), ":cost": cost_jpy}
+            Key={"metric_date": current_month},
+            UpdateExpression="SET updated_at=:u ADD total_cost_jpy :cost",
+            ExpressionAttributeValues={":u": now(), ":cost": cost_jpy}
         )
-
 
         jobs_t.update_item(
             Key={"id": job_id},
@@ -280,7 +507,12 @@ def handler(event, context):
                 },
             )
 
-        return {"ok": True, "job_id": job_id, "usage_metrics": json.loads(json.dumps(usage_metrics, default=float))}
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "usage_metrics": json.loads(json.dumps(usage_metrics, default=float)),
+            "overlay_lines": len(overlay_lines),
+        }
 
     except Exception as e:
         err_msg = corsafe(str(e))
