@@ -873,7 +873,7 @@ function OcrResult() {
     // ローディングスピナーコンポーネント
     const LoadingSpinner = () => (
         <div className={styles.loadingContainer}>
-            <div className={styles.spinner}></div>
+            <SportsPictoLoading message="処理中..." />
         </div>
     );
 
